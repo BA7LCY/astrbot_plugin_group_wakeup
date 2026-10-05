@@ -1,0 +1,111 @@
+{
+  "silence_minutes": {
+    "type": "int",
+    "description": "冷场阈值（分钟）",
+    "hint": "群内超过该时间没有活动时视为冷场。",
+    "default": 40
+  },
+  "random_delay_minutes": {
+    "type": "int",
+    "description": "随机延时上限（分钟）",
+    "hint": "范围 0～120 分钟。目标时间为最后活动时间 + 冷场阈值 + 0 到该值的随机延时；每轮只抽一次，重启保留，有新活动后重算。0 表示按固定阈值触发，实际在目标到达后的巡检中执行。",
+    "default": 5
+  },
+  "dead_group_minutes": {
+    "type": "int",
+    "description": "死群上限（分钟）",
+    "hint": "从最后真实活动起算死群截止，主动唤醒不会重置计时。每轮唤醒完成后会按新的随机延时继续尝试，超过该上限后停止。每日上限、免打扰等限制仍会生效。",
+    "default": 360
+  },
+  "daily_limit": {
+    "type": "int",
+    "description": "每日每群唤醒上限",
+    "hint": "0 表示不限制。无人回应时仍可继续按轮唤醒；要允许 360/40 这样的多轮唤醒，需设为 0 或至少设为目标次数。",
+    "default": 1
+  },
+  "check_interval_seconds": {
+    "type": "int",
+    "description": "后台巡检间隔（秒）",
+    "default": 60
+  },
+  "history_enabled": {
+    "type": "bool",
+    "description": "记录最近群聊内容",
+    "default": true
+  },
+  "history_size": {
+    "type": "int",
+    "description": "注入提示词的最近消息条数",
+    "default": 20
+  },
+  "recent_topics_size": {
+    "type": "int",
+    "description": "防重复保留的最近话题条数",
+    "default": 5
+  },
+  "quiet_time_enabled": {
+    "type": "bool",
+    "description": "启用夜间免打扰",
+    "default": true
+  },
+  "quiet_time_start": {
+    "type": "string",
+    "description": "免打扰开始时间",
+    "default": "23:00"
+  },
+  "quiet_time_end": {
+    "type": "string",
+    "description": "免打扰结束时间",
+    "default": "07:00"
+  },
+  "generation_mode": {
+    "type": "string",
+    "description": "唤醒内容生成模式",
+    "hint": "轻量工具调用：直连工具循环；纯文本生成：不执行工具；标准消息链：模拟后台事件，经过框架的插件钩子、主 Agent 追踪及回复发送，唤醒提示词注入本次 system_prompt。不兼容旧英文模式值，请重新选择。",
+    "options": ["轻量工具调用", "纯文本生成", "标准消息链"],
+    "default": "轻量工具调用"
+  },
+  "provider_id": {
+    "type": "string",
+    "description": "指定模型服务商",
+    "hint": "留空时跟随当前会话模型。",
+    "_special": "select_provider",
+    "default": ""
+  },
+  "agent_max_steps": {
+    "type": "int",
+    "description": "轻量工具调用最大轮数",
+    "hint": "只作用于轻量工具调用；标准消息链跟随 AstrBot 的 Agent Runner 配置。",
+    "default": 8
+  },
+  "agent_tool_call_timeout": {
+    "type": "int",
+    "description": "轻量工具调用单次工具超时（秒）",
+    "default": 120
+  },
+  "pipeline_timeout_seconds": {
+    "type": "int",
+    "description": "标准消息链等待上限（秒）",
+    "hint": "包含排队、模型、工具及回复处理时间，范围 30～3600。超时后关闭本次事件发送并熔断；不会强行中断第三方插件已启动的外部任务。",
+    "default": 600
+  },
+  "blacklist": {
+    "type": "list",
+    "description": "黑名单（永不唤醒）",
+    "hint": "可填平台群号或 UMO 中的 session_id。",
+    "default": []
+  },
+  "whitelist": {
+    "type": "list",
+    "description": "白名单（留空表示所有群）",
+    "hint": "可填平台群号或 UMO 中的 session_id。",
+    "default": []
+  },
+  "topic_prompt": {
+    "type": "text",
+    "description": "唤醒提示词（整段自定义）",
+    "hint": "标准消息链：整段追加到本次 system_prompt，不重复作为用户提示词；其他两种模式仍作为用户提示词。无隐藏任务规则，是否必须自拍等要求请自行填写。占位符可选：{{persona}}=会话人格（标准链本身会注入人格，通常无需重复填写）；{{time}}=本地时间；{{group_id}}=群号；{{group_name}}=群名；{{recent_history}}=最近群聊；{{recent_topics}}=最近唤醒内容。未知占位符保留原文。",
+    "obvious_hint": true,
+    "default": "群里已经很久没有人说话了。请你以自己的身份自然地开口，把气氛重新带起来。\n\n要求：\n- 只输出要发送到群里的内容，不要解释、不要前后缀\n- 像真人随手开口那样简短自然，不要说“大家好”，不要客服腔\n- 不要重复最近已经发过的话题\n- 如果想配合动作（例如自拍、发图），直接调用你可用的工具完成\n\n当前时间：{{time}}\n群名：{{group_name}}\n\n最近群聊记录（只作参考，不要复述）：\n{{recent_history}}\n\n你最近发过的话题（不要重复）：\n{{recent_topics}}"
+  }
+}
