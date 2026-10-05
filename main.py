@@ -13,7 +13,6 @@ import random
 import re
 import sys
 import time
-import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -168,7 +167,8 @@ class _SyntheticWakeEvent(AstrMessageEvent):
         message_obj.group_id = group_id or session.session_id
         if message_obj.group is not None:
             message_obj.group.group_name = group_name
-        message_obj.message_id = f"group_wakeup_{uuid.uuid4().hex}"
+        # 不编号，避免后台工具回调拿去引用一条平台上不存在的消息。
+        message_obj.message_id = ""
         message_obj.sender = MessageMember(
             user_id=sender_id or session.session_id,
             nickname="GroupWakeup",
@@ -183,6 +183,7 @@ class _SyntheticWakeEvent(AstrMessageEvent):
         self.context_obj = context
         self.is_at_or_wake_command = True
         self.is_wake = True
+        self.set_extra("group_wakeup", True)
 
     async def send(self, message: MessageChain) -> None:
         if message is None:
@@ -215,7 +216,6 @@ class _PipelineWakeEvent(_SyntheticWakeEvent):
         self.delivered = False
         self.message_obj.message = [At(qq=self.get_self_id()), Plain(WAKE_EVENT_TEXT)]
         self.message_obj.raw_message = {"group_wakeup": True}
-        self.set_extra("group_wakeup", True)
         self.set_extra("_api_key_allow_admin_role", False)
         self.set_extra("enable_streaming", False)
         self.set_extra("enable_reasoning", False)
@@ -464,6 +464,11 @@ class GroupWakeupPlugin(Star):
             if event.closed:
                 event.stop_event()
             return
+        if (
+            self._safe_bool(lambda: event.get_extra("group_wakeup"))
+            or self._safe_str(event.get_sender_name) == "GroupWakeup"
+        ):
+            return
         try:
             umo = str(event.unified_msg_origin)
             if not umo:
@@ -523,7 +528,11 @@ class GroupWakeupPlugin(Star):
 
     @filter.after_message_sent()
     async def after_message_sent(self, event: AstrMessageEvent) -> None:
-        if isinstance(event, _PipelineWakeEvent):
+        if (
+            isinstance(event, _PipelineWakeEvent)
+            or self._safe_bool(lambda: event.get_extra("group_wakeup"))
+            or self._safe_str(event.get_sender_name) == "GroupWakeup"
+        ):
             return
         try:
             if self._safe_bool(event.is_private_chat, True):
@@ -914,18 +923,30 @@ class GroupWakeupPlugin(Star):
                 system_prompt=system_prompt,
             )
         elif mode == MODE_TOOLS:
-            event = _SyntheticWakeEvent(context=self.context, umo=umo, message=prompt)
-            response = await self.context.tool_loop_agent(
-                event=event,
-                chat_provider_id=provider_id,
-                prompt=prompt,
-                tools=self._tools_for_persona(persona),
-                system_prompt=system_prompt,
-                max_steps=self._cfg_int("agent_max_steps", 8, lo=1, hi=30),
-                tool_call_timeout=self._cfg_int(
-                    "agent_tool_call_timeout", 120, lo=1, hi=600
-                ),
+            event = _SyntheticWakeEvent(
+                context=self.context,
+                umo=umo,
+                message=prompt,
+                self_id=str(group.get("self_id") or ""),
+                group_id=str(group.get("group_id") or ""),
+                group_name=str(group.get("group_name") or ""),
             )
+            try:
+                response = await self.context.tool_loop_agent(
+                    event=event,
+                    chat_provider_id=provider_id,
+                    prompt=prompt,
+                    tools=self._tools_for_persona(persona),
+                    system_prompt=system_prompt,
+                    max_steps=self._cfg_int("agent_max_steps", 8, lo=1, hi=30),
+                    tool_call_timeout=self._cfg_int(
+                        "agent_tool_call_timeout", 120, lo=1, hi=600
+                    ),
+                )
+            except Exception as exc:
+                if "Agent did not produce a final LLM response" in str(exc):
+                    return ""
+                raise
         else:
             raise RuntimeError("标准消息链必须通过事件队列执行")
 
@@ -969,6 +990,16 @@ class GroupWakeupPlugin(Star):
             group.get("last_activity", 0.0)
         ) != activity_before:
             logger.info("[群聊唤醒] 群 %s 在生成期间恢复活动，取消发送", umo)
+            return
+
+        # 工具把结果直接交给平台时，Agent 可能没有最终文本；本轮仍算完成。
+        if not text:
+            self._roll_daily(group, now)
+            group["topics_today"] += 1
+            group["last_attempt_at"] = now
+            self._clear_wake_after(group)
+            self._save_state()
+            logger.info("[群聊唤醒] 群 %s 已由工具直接处理，本轮计次", umo)
             return
 
         old_topics_today = int(group.get("topics_today", 0))
