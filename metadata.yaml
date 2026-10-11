@@ -1,7 +1,7 @@
 name: astrbot_plugin_group_wakeup
 display_name: 群聊唤醒
 desc: 监控群聊冷场，按“冷场+随机延时”轮次主动唤醒，直到到达死群上限；群友回应后交给其他插件继续。
-version: v0.2.3
+version: v0.2.4
 author: BA7LCY
 repo: https://github.com/BA7LCY/astrbot_plugin_group_wakeup
 astrbot_version: ">=4.22.0,<5"

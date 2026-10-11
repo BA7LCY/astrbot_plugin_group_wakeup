@@ -13,7 +13,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -277,6 +277,7 @@ class GroupWakeupPlugin(Star):
         self._state: dict[str, Any] = {"groups": {}}
         self._task: asyncio.Task[None] | None = None
         self._pipeline_events: dict[str, _PipelineWakeEvent | None] = {}
+        self._wake_tasks: dict[str, asyncio.Task[None]] = {}
 
     async def initialize(self) -> None:
         self._load_state()
@@ -290,6 +291,12 @@ class GroupWakeupPlugin(Star):
         for event in list(self._pipeline_events.values()):
             if event is not None:
                 event.close()
+        wake_tasks = list(self._wake_tasks.values())
+        self._wake_tasks.clear()
+        for task in wake_tasks:
+            task.cancel()
+        if wake_tasks:
+            await asyncio.gather(*wake_tasks, return_exceptions=True)
         task = self._task
         self._task = None
         if task is not None:
@@ -393,6 +400,7 @@ class GroupWakeupPlugin(Star):
         group.setdefault("wake_after_activity", 0.0)
         group.setdefault("wake_after_delay_max", 0)
         group.setdefault("wake_after_silence_minutes", 0)
+        group.setdefault("quiet_resume_at", 0.0)
         group.setdefault("breaker_tripped", False)
         group.setdefault("breaker_reason", "")
         group.setdefault("breaker_tripped_at", 0.0)
@@ -492,6 +500,7 @@ class GroupWakeupPlugin(Star):
                 group["last_activity"] = now
                 group["last_attempt_at"] = 0.0
                 self._clear_wake_after(group)
+                group["quiet_resume_at"] = 0.0
 
 
             message_id = str(getattr(event.message_obj, "message_id", "") or "")
@@ -548,6 +557,7 @@ class GroupWakeupPlugin(Star):
                 group["last_activity"] = now
                 group["last_attempt_at"] = 0.0
                 self._clear_wake_after(group)
+                group["quiet_resume_at"] = 0.0
 
             text = self._result_text(event)
             if _looks_like_upstream_llm_error(text):
@@ -608,23 +618,58 @@ class GroupWakeupPlugin(Star):
             return start <= minute < end
         return minute >= start or minute < end
 
+    def _quiet_end_timestamp(self, now: float) -> float:
+        end = self._parse_time(
+            self._cfg_str("quiet_time_end", "07:00"), 7 * 60
+        )
+        current = datetime.fromtimestamp(now)
+        candidate = current.replace(
+            hour=end // 60,
+            minute=end % 60,
+            second=0,
+            microsecond=0,
+        )
+        if candidate.timestamp() <= now:
+            candidate += timedelta(days=1)
+        return candidate.timestamp()
+
     def _can_wake(self, group: dict[str, Any], now: float) -> bool:
-        if group.get("umo") in self._pipeline_events:
+        umo = str(group.get("umo", "") or "")
+        if umo in self._pipeline_events:
+            return False
+        wake_task = self._wake_tasks.get(umo)
+        if wake_task is not None and not wake_task.done():
             return False
         if group.get("breaker_tripped"):
             return False
         if not self._group_allowed(group):
             return False
         if self._in_quiet_time(now):
+            if not self._cfg_bool("quiet_time_enabled", True):
+                return False
+            quiet_resume_at = self._quiet_end_timestamp(now)
+            if float(group.get("quiet_resume_at", 0.0) or 0.0) != quiet_resume_at:
+                group["quiet_resume_at"] = quiet_resume_at
+                self._clear_wake_after(group)
+                self._save_state()
             return False
+
+        quiet_resume_at = float(group.get("quiet_resume_at", 0.0) or 0.0)
+        if quiet_resume_at > now:
+            # Quiet configuration changed while the group was waiting.
+            group["quiet_resume_at"] = 0.0
+            self._clear_wake_after(group)
+            self._save_state()
+            quiet_resume_at = 0.0
 
         last_activity = float(group.get("last_activity", 0.0) or 0.0)
         if last_activity <= 0:
             return False
-        silence = now - last_activity
+        activity_anchor = max(last_activity, quiet_resume_at)
+        silence = now - activity_anchor
         last_attempt_at = float(group.get("last_attempt_at", 0.0) or 0.0)
         # 死群截止从最后真实活动起算；下一轮的冷场间隔从上次尝试起算。
-        interval_anchor = max(last_activity, last_attempt_at)
+        interval_anchor = max(activity_anchor, last_attempt_at)
         interval = now - interval_anchor
         silence_minutes = self._cfg_int("silence_minutes", 40, lo=1, hi=1440)
         dead_group_minutes = self._cfg_int(
@@ -923,6 +968,19 @@ class GroupWakeupPlugin(Star):
                 system_prompt=system_prompt,
             )
         elif mode == MODE_TOOLS:
+            manager = getattr(self.context, "conversation_manager", None)
+            if manager is not None:
+                try:
+                    if not await manager.get_curr_conversation_id(umo):
+                        await manager.new_conversation(
+                            umo, MessageSession.from_str(umo).platform_id
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "[群聊唤醒] 无法准备群 %s 的对话记录，继续执行工具：%s",
+                        umo,
+                        exc,
+                    )
             event = _SyntheticWakeEvent(
                 context=self.context,
                 umo=umo,
@@ -1044,18 +1102,37 @@ class GroupWakeupPlugin(Star):
                 "check_interval_seconds", 60, lo=10, hi=3600
             )
             await asyncio.sleep(interval)
+            await self._patrol_once(time.time())
 
-            now = time.time()
-            groups = list(self._state.get("groups", {}).items())
-            for umo, group in groups:
-                if not isinstance(group, dict):
-                    continue
-                self._roll_daily(group, now)
-                if not self._can_wake(group, now):
-                    continue
-                try:
-                    await self._send_wakeup(umo, group, now)
-                except asyncio.CancelledError:
-                    raise
-                except Exception as exc:
-                    self._trip_breaker(group, f"生成或发送失败：{exc}")
+    async def _patrol_once(self, now: float) -> None:
+        groups = list(self._state.get("groups", {}).items())
+        for umo, group in groups:
+            if not isinstance(group, dict):
+                continue
+            self._roll_daily(group, now)
+            if self._can_wake(group, now):
+                self._schedule_wake(umo, group, now)
+
+    def _schedule_wake(self, umo: str, group: dict[str, Any], now: float) -> None:
+        existing = self._wake_tasks.get(umo)
+        if existing is not None and not existing.done():
+            return
+        task = asyncio.create_task(
+            self._run_wake(umo, group, now),
+            name=f"group-wakeup:{umo}",
+        )
+        self._wake_tasks[umo] = task
+
+        def clear_task(done: asyncio.Task[None]) -> None:
+            if self._wake_tasks.get(umo) is done:
+                self._wake_tasks.pop(umo, None)
+
+        task.add_done_callback(clear_task)
+
+    async def _run_wake(self, umo: str, group: dict[str, Any], now: float) -> None:
+        try:
+            await self._send_wakeup(umo, group, now)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._trip_breaker(group, f"生成或发送失败：{exc}")
